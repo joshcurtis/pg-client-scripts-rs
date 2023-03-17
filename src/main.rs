@@ -4,7 +4,7 @@ use ::postgres::{Client, NoTls};
 fn check_if_accounts_exists(client: &mut Client) -> bool {
     let sql = "SELECT * FROM pg_stat_user_tables WHERE relname = 'accounts';";
     let row = client.query_opt(sql, &[]).unwrap();
-    return row.is_some();
+    row.is_some()
 }
 
 fn create_accounts_table(client: &mut Client) {
@@ -25,18 +25,18 @@ fn insert_into_accounts(client: &mut Client, idem_key: &str) -> i64 {
         "SELECT a_id FROM accounts WHERE idempotency_key = $1",
         &[&idem_key]
     ).unwrap();
-    if opt_row.is_some() {
+    if let Some(..) = opt_row {
         return opt_row.unwrap().get(0)
     }
 
     let sql = "INSERT INTO accounts(idempotency_key, balance) VALUES($1, $2) RETURNING a_id";
     let bal: i64 = 0;
-    return client.query_one(
+    client.query_one(
         sql,
         &[&idem_key, &bal],
     )
         .unwrap()
-        .get(0);
+        .get(0)
 }
 
 fn update_account_balance(client: &mut Client, a_id: i64, balance: i64) {
