@@ -131,14 +131,16 @@ fn experiment_insert_into_accounts_until_heapprune(client: &mut Client) {
     assert_eq!(1, *lpflag_to_count.get(&2).unwrap());
 }
 
-fn experiment_insert_into_accounts_with_concurrent_tx_on_old_accounts_snapshot(client: &mut Client) {
+fn experiment_insert_into_accounts_with_concurrent_tx(client: &mut Client, select_relation: String) {
     // rebuild accounts table and add a row
     reset_accounts_table(client);
     let a_id = insert_into_accounts( client, "2y");
 
     let mut other_client = connect_to_local();
     let mut tx = other_client.transaction().unwrap();
-    let select_from_accounts = "SELECT * FROM accounts;";
+    // rust strings o_O
+    let blah = format!("SELECT * FROM {}", select_relation);
+    let select_from_accounts = blah.as_str();
     tx.execute(select_from_accounts, &[]).unwrap();
 
     for i in 1..(ACCT_TUPLES_HOT_UPDATES_PER_PRUNE - 1) {
@@ -163,7 +165,7 @@ fn experiment_insert_into_accounts_with_concurrent_tx_on_old_accounts_snapshot(c
     // Commit the transaction
     // Now when we read the page, postgres prunes it
     tx.commit().unwrap();
-    client.execute(select_from_accounts, &[]);
+    client.execute("SELECT * FROM accounts;", &[]);
     let acct_page_items = heap_page_items(client, "accounts", 0);
     let num_tuples_in_page = acct_page_items.len();
     assert_eq!(num_tuples_in_page, 17);
@@ -171,15 +173,30 @@ fn experiment_insert_into_accounts_with_concurrent_tx_on_old_accounts_snapshot(c
     assert_eq!(15, *lpflag_to_count.get(&0).unwrap());
     assert_eq!(1, *lpflag_to_count.get(&1).unwrap());
     assert_eq!(1, *lpflag_to_count.get(&2).unwrap());
-    wait_for_enter()
+}
+
+
+
+fn experiment_insert_into_with_tx_on_unrelated_table(client: &mut Client) {
+    // prepare to go to the moon
+    client.batch_execute("
+        DROP TABLE IF EXISTS rockets;
+        CREATE TABLE rockets(rocket_id BIGINT PRIMARY KEY);
+    ").unwrap();
+    client.execute("INSERT INTO rockets VALUES", &[]).unwrap();
+    experiment_insert_into_accounts_with_concurrent_tx(client, "rockets".to_string());
 }
 
 fn main() {
     println!("Hello, world!");
 
     let mut client = connect_to_local();
+
+    // So logical replication *would* be sufficient to
     experiment_insert_into_accounts_until_heapprune(&mut client);
-    experiment_insert_into_accounts_with_concurrent_tx_on_old_accounts_snapshot(&mut client);
+    experiment_insert_into_accounts_with_concurrent_tx(&mut client, "accounts".to_string());
+    experiment_insert_into_with_tx_on_unrelated_table(&mut client);
+    println!("woah")
 }
 
 
