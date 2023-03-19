@@ -1,4 +1,18 @@
+use std::arch::aarch64::float32x2_t;
+use std::collections::{BTreeMap, HashMap};
+use std::thread;
 use ::postgres::{Client, NoTls};
+use postgres_types::{ToSql, FromSql};
+use postgres::Row;
+
+
+// derive from sql
+
+struct HeapPageItem {
+    lp_flags: i32,
+    t_xmin: Option<String>,
+    t_xmax: Option<String>,
+}
 
 
 fn check_if_accounts_exists(client: &mut Client) -> bool {
@@ -7,13 +21,26 @@ fn check_if_accounts_exists(client: &mut Client) -> bool {
     row.is_some()
 }
 
-fn create_accounts_table(client: &mut Client) {
+fn heap_page_items(client: &mut Client, relname: &str, blkno: u32) -> Vec<HeapPageItem> {
+    // lol use string formatting because the rust crate can't serialize to an Int8?
+    let sql = format!("SELECT lp_flags::int, t_xmin::text, t_xmax::text FROM heap_page_items(get_raw_page($1, {}))", blkno);
+    let rows = client.query(&sql, &[&relname])
+        .unwrap();
+    rows.into_iter().map(|row| HeapPageItem {
+        lp_flags: row.get(0),
+        t_xmin: row.get(1),
+        t_xmax: row.get(2),
+    }).collect::<Vec<HeapPageItem>>()
+}
+
+
+fn reset_accounts_table(client: &mut Client) {
     let sql = "
 DROP TABLE IF EXISTS accounts;
 CREATE TABLE accounts(
     a_id            BIGSERIAL PRIMARY KEY,
     idempotency_key TEXT    NOT NULL,
-    balance         BIGINT NOT NULL
+    balance         BIGINT NOT NULL CHECK (balance >= 0)
 ) WITH (FILLFACTOR = 10);
 CREATE UNIQUE INDEX idempotency_key_idx ON accounts (idempotency_key);
 ";
@@ -23,10 +50,10 @@ CREATE UNIQUE INDEX idempotency_key_idx ON accounts (idempotency_key);
 fn insert_into_accounts(client: &mut Client, idem_key: &str) -> i64 {
     let opt_row = client.query_opt(
         "SELECT a_id FROM accounts WHERE idempotency_key = $1",
-        &[&idem_key]
+        &[&idem_key],
     ).unwrap();
     if let Some(..) = opt_row {
-        return opt_row.unwrap().get(0)
+        return opt_row.unwrap().get(0);
     }
 
     let sql = "INSERT INTO accounts(idempotency_key, balance) VALUES($1, $2) RETURNING a_id";
@@ -42,7 +69,7 @@ fn insert_into_accounts(client: &mut Client, idem_key: &str) -> i64 {
 fn update_account_balance(client: &mut Client, a_id: i64, balance: i64) {
     client.execute(
         "UPDATE accounts SET balance = $2 WHERE a_id = $1",
-        &[&a_id, &balance]
+        &[&a_id, &balance],
     ).unwrap();
 }
 
@@ -50,15 +77,35 @@ fn main() {
     println!("Hello, world!");
 
     let mut client = Client::connect("host=localhost port=21800 user=josh dbname=postgres", NoTls).unwrap();
-    if !check_if_accounts_exists(&mut client) {
-        println!("Creating accounts");
-        create_accounts_table(&mut client);
-    }
+    println!("Creating accounts");
+    reset_accounts_table(&mut client);
     let a_id = insert_into_accounts(&mut client, "2y");
     //println!("Got {}", a_id);
 
+    let tuples_to_fill_page = 160;
+
     println!("updating balance");
-    for i in 0..20 {
+    // start from 1 b/c we already did an insert
+    for i in 1..tuples_to_fill_page {
         update_account_balance(&mut client, a_id, i);
+        let heap_page_items = heap_page_items(&mut client, "accounts", 0);
+        // group heap_page_items by item.lp_flags
+        let lp_flag_to_count: BTreeMap<i32, i32> = heap_page_items.iter()
+            .fold(BTreeMap::new(),|mut lp_flag_to_count, item| {
+                let count = lp_flag_to_count.entry(item.lp_flags).or_insert(0);
+                *count += 1;
+                lp_flag_to_count
+            });
+        println!("--------");
+        lp_flag_to_count.iter().for_each(|(lp_flag, count)| {
+            println!("lp_flag: {} count: {}", lp_flag, count);
+        });
+
+
+        let lp_flags2_count = heap_page_items.iter().filter(|item| item.lp_flags == 2).count();
+        if lp_flags2_count > 0 {
+            println!("lp_flags2_count: {} at {} tuples", lp_flags2_count, i);
+            return;
+        }
     }
 }
