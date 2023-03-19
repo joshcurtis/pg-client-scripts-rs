@@ -14,6 +14,13 @@ struct HeapPageItem {
     t_xmax: Option<String>,
 }
 
+// TODO(josh): You can probably derive this from fillfactor and bytes per tuple
+const ACCT_TUPLES_PER_PAGE: i64 = 157;
+const ACCT_TUPLES_HOT_UPDATES_PER_PRUNE: i64 = 17;
+
+// TODO(josh): pad stuff so that ACCT_TUPLES_PER_PAGE is divisible by ACCT_TUPLES_HOT_UPDATES_PER_PRUNE
+
+
 
 fn get_num_pages(client: &mut Client, relname: &str) -> i32 {
     client.execute(format!("ANALYZE {}", relname).as_str(), &[]).unwrap();
@@ -86,12 +93,21 @@ fn update_account_balance(client: &mut Client, a_id: i64, balance: i64) {
     ).unwrap();
 }
 
+fn count_tuples_by_lpflag(heap_page_items: Vec<HeapPageItem>) -> BTreeMap<i32, i32> {
+    heap_page_items.iter()
+        .fold(BTreeMap::new(), |mut map, item| {
+            let count = map.entry(item.lp_flags).or_insert(0);
+            *count += 1;
+            map
+        })
+}
+
 fn experiment_insert_into_accounts_until_heapprune(client: &mut Client) {
     reset_accounts_table(client);
     let a_id = insert_into_accounts(client, "2y");
     // count from 1 since we inserted a tuple above
     // each update "inserts" 1 new tuple into the page, insert might be the wrong word
-    for num_tuples_inserted in 1..16 {
+    for num_tuples_inserted in 1..(ACCT_TUPLES_HOT_UPDATES_PER_PRUNE - 1) {
         let balance = num_tuples_inserted; // use num tuples insert as balance to make inspection a bit easier
         update_account_balance(client, a_id, balance)
     }
@@ -103,6 +119,9 @@ fn experiment_insert_into_accounts_until_heapprune(client: &mut Client) {
     let lpflag_to_count = count_tuples_by_lpflag(acct_page_items);
     assert_eq!(16, *lpflag_to_count.get(&1).unwrap());
 
+    // Update the row again, instead of adding another tuple to the page,
+    // postgres prunes the page
+    // TODO(josh): figure out the details.
     update_account_balance(client, a_id, 17);
     let acct_page_items = heap_page_items(client, "accounts", 0);
     assert_eq!(acct_page_items.len(), 16);
@@ -110,16 +129,49 @@ fn experiment_insert_into_accounts_until_heapprune(client: &mut Client) {
     assert_eq!(13, *lpflag_to_count.get(&0).unwrap());
     assert_eq!(2, *lpflag_to_count.get(&1).unwrap());
     assert_eq!(1, *lpflag_to_count.get(&2).unwrap());
-    wait_for_enter()
 }
 
-fn count_tuples_by_lpflag(heap_page_items: Vec<HeapPageItem>) -> BTreeMap<i32, i32> {
-    heap_page_items.iter()
-        .fold(BTreeMap::new(), |mut map, item| {
-            let count = map.entry(item.lp_flags).or_insert(0);
-            *count += 1;
-            map
-    })
+fn experiment_insert_into_accounts_with_concurrent_tx_on_old_accounts_snapshot(client: &mut Client) {
+    // rebuild accounts table and add a row
+    reset_accounts_table(client);
+    let a_id = insert_into_accounts( client, "2y");
+
+    let mut other_client = connect_to_local();
+    let mut tx = other_client.transaction().unwrap();
+    let select_from_accounts = "SELECT * FROM accounts;";
+    tx.execute(select_from_accounts, &[]).unwrap();
+
+    for i in 1..(ACCT_TUPLES_HOT_UPDATES_PER_PRUNE - 1) {
+        update_account_balance(client, a_id, i);
+    }
+    // like before, we have a HOT chain
+    let acct_page_items = heap_page_items(client, "accounts", 0);
+    assert_eq!(acct_page_items.len(), 16);
+    let lpflag_to_count = count_tuples_by_lpflag(acct_page_items);
+    assert_eq!(16, *lpflag_to_count.get(&1).unwrap());
+    // Add another tuple,
+    // since there's a concurrent transaction with an old snapshot, postgre won't prune
+    // TODO(josh): Details of why
+    update_account_balance(client, a_id, ACCT_TUPLES_PER_PAGE);
+    let acct_page_items = heap_page_items(client, "accounts", 0);
+    let num_tuples_in_page = acct_page_items.len();
+    assert_eq!(num_tuples_in_page, 17);
+    let lpflag_to_count = count_tuples_by_lpflag(acct_page_items);
+    assert_eq!(17, *lpflag_to_count.get(&1).unwrap());
+
+
+    // Commit the transaction
+    // Now when we read the page, postgres prunes it
+    tx.commit().unwrap();
+    client.execute(select_from_accounts, &[]);
+    let acct_page_items = heap_page_items(client, "accounts", 0);
+    let num_tuples_in_page = acct_page_items.len();
+    assert_eq!(num_tuples_in_page, 17);
+    let lpflag_to_count = count_tuples_by_lpflag(acct_page_items);
+    assert_eq!(15, *lpflag_to_count.get(&0).unwrap());
+    assert_eq!(1, *lpflag_to_count.get(&1).unwrap());
+    assert_eq!(1, *lpflag_to_count.get(&2).unwrap());
+    wait_for_enter()
 }
 
 fn main() {
@@ -127,41 +179,7 @@ fn main() {
 
     let mut client = connect_to_local();
     experiment_insert_into_accounts_until_heapprune(&mut client);
-
-    println!("----------------------------------------------------------------");
-    println!("new experiment");
-    reset_accounts_table(&mut client);
-    let a_id = insert_into_accounts(&mut client, "2y");
-
-    let mut client2 = connect_to_local();
-    let mut tx = client2.transaction().unwrap();
-    tx.execute("SELECT * FROM accounts;", &[]).unwrap();
-
-    for i in 1..20000 {
-        update_account_balance(&mut client, a_id, i);
-        // pages aren't necessarily 1:1 with blocks, but we can assume they are 1:1 here
-        let n_pages = get_num_pages(&mut client, "accounts");
-        let heap_page_items = heap_page_items(&mut client, "accounts", n_pages - 1);
-        let lp_flags2_count = heap_page_items.iter().filter(|item| item.lp_flags == 2).count();
-        if lp_flags2_count > 0 {
-            println!("lp_flags2_count: {} at {} tuples", lp_flags2_count, i);
-            return;
-        }
-    }
-    let n_pages = get_num_pages(&mut client, "accounts");
-    let heap_page_items = heap_page_items(&mut client, "accounts", n_pages - 1);
-    let lp_flag_to_count: BTreeMap<i32, i32> = heap_page_items.iter()
-        .fold(BTreeMap::new(),|mut lp_flag_to_count, item| {
-            let count = lp_flag_to_count.entry(item.lp_flags).or_insert(0);
-            *count += 1;
-            lp_flag_to_count
-        });
-    println!("num pages: {}", n_pages);
-    lp_flag_to_count.iter().for_each(|(lp_flag, count)| {
-        println!("(lp_flag: {} count: {}", lp_flag, count);
-    });
-
-    wait_for_enter()
+    experiment_insert_into_accounts_with_concurrent_tx_on_old_accounts_snapshot(&mut client);
 }
 
 
