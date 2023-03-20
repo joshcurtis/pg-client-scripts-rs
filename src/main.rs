@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::thread;
 use ::postgres::{Client, NoTls};
 use postgres_types::{ToSql, FromSql};
-use postgres::{Error, Row};
+use postgres::{Error, Row, Transaction};
 
 
 // derive from sql
@@ -17,8 +17,7 @@ struct HeapPageItem {
 // TODO(josh): You can probably derive this from fillfactor and bytes per tuple
 const ACCT_TUPLES_PER_PAGE: i64 = 157;
 const ACCT_TUPLES_HOT_UPDATES_PER_PRUNE: i64 = 17;
-
-// TODO(josh): pad stuff so that ACCT_TUPLES_PER_PAGE is divisible by ACCT_TUPLES_HOT_UPDATES_PER_PRUNE
+// TODO(josh): pad stuff so that ACCT_TUPLES_PER_PAGE is divisible by ACCT_TUPLES_HOT_UPDATES_PER_PRUNE?
 
 
 
@@ -33,12 +32,6 @@ fn get_num_pages(client: &mut Client, relname: &str) -> i32 {
             panic!("{}", err)
         }
     }
-}
-
-fn check_if_accounts_exists(client: &mut Client) -> bool {
-    let sql = "SELECT * FROM pg_stat_user_tables WHERE relname = 'accounts';";
-    let row = client.query_opt(sql, &[]).unwrap();
-    row.is_some()
 }
 
 fn heap_page_items(client: &mut Client, relname: &str, blkno: i32) -> Vec<HeapPageItem> {
@@ -62,7 +55,7 @@ CREATE TABLE accounts(
     idempotency_key TEXT    NOT NULL,
     balance         BIGINT NOT NULL CHECK (balance >= 0)
 ) WITH (FILLFACTOR = 10);
-CREATE UNIQUE INDEX idempotency_key_idx ON accounts (idempotency_key);
+CREATE INDEX idempotency_key_idx ON accounts (idempotency_key);
 ";
     client.batch_execute(sql).unwrap();
 }
@@ -165,7 +158,7 @@ fn experiment_insert_into_accounts_with_concurrent_tx(client: &mut Client, selec
     // Commit the transaction
     // Now when we read the page, postgres prunes it
     tx.commit().unwrap();
-    client.execute("SELECT * FROM accounts;", &[]);
+    client.execute("SELECT * FROM accounts;", &[]).unwrap();
     let acct_page_items = heap_page_items(client, "accounts", 0);
     let num_tuples_in_page = acct_page_items.len();
     assert_eq!(num_tuples_in_page, 17);
@@ -181,22 +174,81 @@ fn experiment_insert_into_with_tx_on_unrelated_table(client: &mut Client) {
     // prepare to go to the moon
     client.batch_execute("
         DROP TABLE IF EXISTS rockets;
-        CREATE TABLE rockets(rocket_id BIGINT PRIMARY KEY);
+        CREATE TABLE rockets(rocket_id BIGSERIAL PRIMARY KEY);
     ").unwrap();
-    client.execute("INSERT INTO rockets VALUES", &[]).unwrap();
+    client.execute("INSERT INTO rockets DEFAULT VALUES", &[]).unwrap();
     experiment_insert_into_accounts_with_concurrent_tx(client, "rockets".to_string());
 }
 
-fn main() {
-    println!("Hello, world!");
 
+fn experiment_how_does_not_sweeping_HOT_chains_affect_idx_tup_read(client: &mut Client) {
+    reset_accounts_table(client);
+
+    let get_accounts_pkey_idx_tup_read = |client: &mut Client| -> i64 {
+        // pg_stat_user_indexes lags a bit, sleep so postgres can catch up
+        thread::sleep(std::time::Duration::from_millis(500));
+        let accts_pkey_reads_sql = "SELECT idx_tup_read FROM pg_stat_user_indexes WHERE indexrelname = 'accounts_pkey'";
+        client.query_one(accts_pkey_reads_sql, &[]).unwrap().get(0)
+    };
+
+    let get_num_accounts_pages = |client: &mut Client| -> i32 {
+        let num_pages_sql = "SELECT relpages FROM pg_class WHERE relname = 'accounts'";
+        client.execute("ANALYZE accounts;", &[]).unwrap();
+        client.query_one(num_pages_sql, &[]).unwrap().get(0)
+    };
+
+    // force pg to use the index
+    client.execute("SET enable_seqscan = OFF;", &[]).unwrap();
+    let a_id = insert_into_accounts( client, "2y");
+
+    // huh, doesn't even matter this is READ COMMITTED (i assume), and not repeatable read :o
+    let mut other_client = connect_to_local();
+    let mut tx = other_client.transaction().unwrap();
+    tx.execute("SELECT * FROM accounts", &[]).unwrap();
+    // Fill up a page
+    for i in 1..(ACCT_TUPLES_PER_PAGE) {
+        update_account_balance(client, a_id, i)
+    }
+
+    // We haven't read anything yet
+    let init_tup_reads: i64 = get_accounts_pkey_idx_tup_read(client);
+    // The insert didn't read anything from the index
+    // we did for each update though
+    assert_eq!(ACCT_TUPLES_PER_PAGE - 1, init_tup_reads);
+
+
+    // do a read
+    client.execute(" SELECT * FROM accounts WHERE a_id = 1", &[]).unwrap();
+    assert_eq!(init_tup_reads+1, get_accounts_pkey_idx_tup_read(client));
+
+    // update another row so postgres will create a page
+    assert_eq!(1, get_num_accounts_pages(client));
+    update_account_balance(client, a_id, ACCT_TUPLES_PER_PAGE+1);
+    assert_eq!(2, get_num_accounts_pages(client));
+    assert_eq!(init_tup_reads+2, get_accounts_pkey_idx_tup_read(client));
+
+    client.execute(" SELECT * FROM accounts WHERE a_id = 1", &[]).unwrap();
+    assert_eq!(init_tup_reads+4, get_accounts_pkey_idx_tup_read(client));
+
+
+
+
+
+    tx.commit().unwrap();
+}
+
+fn main() {
     let mut client = connect_to_local();
 
+    experiment_how_does_not_sweeping_HOT_chains_affect_idx_tup_read(&mut client);
+    println!("done");
+    return;
     // So logical replication *would* be sufficient to
     experiment_insert_into_accounts_until_heapprune(&mut client);
     experiment_insert_into_accounts_with_concurrent_tx(&mut client, "accounts".to_string());
     experiment_insert_into_with_tx_on_unrelated_table(&mut client);
-    println!("woah")
+    println!("woah");
+    experiment_how_does_not_sweeping_HOT_chains_affect_idx_tup_read(&mut client);
 }
 
 
